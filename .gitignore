@@ -1,0 +1,10 @@
+# Keys and secrets
+keys.json
+
+# State
+key_rotation.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

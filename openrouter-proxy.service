@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenRouter API Key Rotation Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/openrouter-proxy/proxy.py
+WorkingDirectory=/opt/openrouter-proxy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
