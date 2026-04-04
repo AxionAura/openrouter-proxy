@@ -89,14 +89,21 @@ def get_next_key():
     return keys_list[soonest_idx], remaining
 
 
-def record_failure(key):
+def record_failure(key, error_detail=None):
     state = key_failures.setdefault(key, {"failures": 0, "unlocked_at": 0})
     state["failures"] += 1
     wait = min(60 * (2 ** (state["failures"] - 1)), 3600)
     state["unlocked_at"] = time.time() + wait
     idx = keys_list.index(key)
-    print(f"  [fail] Key {idx+1} #{state['failures']}, unlock {int(wait)}s", flush=True)
+    detail = f" — {error_detail}" if error_detail else ""
+    print(f"  [fail] Key {idx+1} #{state['failures']}, unlock {int(wait)}s{detail}", flush=True)
     save_rotation_state()
+
+
+def record_success(key):
+    if key in key_failures and key_failures[key]["failures"] > 0:
+        key_failures[key] = {"failures": 0, "unlocked_at": 0}
+        save_rotation_state()
 
 
 def _build_req(url, key, body):
@@ -119,7 +126,8 @@ def _is_rate_limited(code, body_bytes):
     if code == 403:
         txt = body_bytes.decode(errors="replace").lower()
         return any(k in txt for k in ["exceeded", "limit", "quota", "rate", "daily"])
-    if code in (400, 402, 500, 503):
+    # Only check 402 (payment required) and 503 (unavailable) as rate limit
+    if code in (402, 503):
         try:
             data = json.loads(body_bytes)
             msg = (data.get("error", {}).get("message", "")).lower()
@@ -195,27 +203,112 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 time.sleep(wait)
             idx = keys_list.index(key)
             print(f"[try] Key {idx+1} (normal) #{attempt}", flush=True)
-            url = f"{OPENROUTER_URL}{path}"
             try:
-                req = _build_req(url, key, body)
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    cb = resp.read()
-                    self._respond(resp.status, cb, "application/json")
-                    print(f"  [ok] Key {idx+1}", flush=True)
-                    return
-            except urllib.error.HTTPError as e:
-                eb = e.read() if hasattr(e, "read") else b""
-                if _is_rate_limited(e.code, eb):
-                    record_failure(key)
-                    continue
-                self._respond(e.code, eb, "application/json")
+                status, resp_body = self._do_non_stream(path, body, key, idx)
+                self._respond(status, resp_body, "application/json")
+                if status == 200:
+                    record_success(key)
                 return
+            except _RateLimited:
+                # Don't increment failure counter — just wait briefly and retry
+                print(f"  [rl] Key {idx+1}, backing off 8s", flush=True)
+                time.sleep(8)
+                continue
             except Exception as e:
-                print(f"  [err] {e}", flush=True)
-                record_failure(key)
+                print(f"  [err] Normal #{attempt}: {e}", flush=True)
+                record_failure(key, str(e)[:100])
                 continue
         save_rotation_state()
         self._respond(429, json.dumps({"error": "All keys rate limited"}).encode(), "application/json")
+
+    def _do_non_stream(self, path, body, key, key_idx):
+        """Send request with stream:true internally, parse SSE, return full JSON response.
+        This avoids HTTP 402 on free-tier OpenRouter accounts."""
+        # Inject stream flag into body
+        data = json.loads(body)
+        data["stream"] = True
+        stream_body = json.dumps(data).encode()
+
+        url_path = f"/api/v1{path}"
+        content_length = str(len(stream_body))
+        headers_dict = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "HTTP-Referer": os.environ.get("PROXY_SITE_URL", "http://localhost"),
+            "X-Title": os.environ.get("PROXY_SITE_NAME", "OpenRouter Key Rotation Proxy"),
+            "Content-Length": content_length,
+        }
+
+        conn = http.client.HTTPSConnection("openrouter.ai", timeout=300)
+        conn.request("POST", url_path, body=stream_body, headers=headers_dict)
+        resp = conn.getresponse()
+
+        # Check for immediate error (rate limit, auth, etc.)
+        if resp.status == 429:
+            resp.read()
+            conn.close()
+            raise _RateLimited(resp.status)
+
+        # Collect all response data including first chunk
+        buf = b""
+        while True:
+            chunk_bytes = resp.read(4096)
+            if not chunk_bytes:
+                break
+            buf += chunk_bytes
+        conn.close()
+
+        if resp.status != 200:
+            return resp.status, buf
+
+        # Parse SSE to accumulate content
+        full_text = ""
+        finish_reason = ""
+        usage = None
+        model_name = ""
+
+        # Parse SSE lines from buffer
+        for line in buf.decode(errors="replace").split("\n"):
+            line = line.strip()
+            if line.startswith("data: "):
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    finish_reason = "stop"
+                    continue
+                try:
+                    chunk = json.loads(payload)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        full_text += content
+                    model_name = chunk.get("model", model_name)
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    fr = chunk.get("choices", [{}])[0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    pass
+
+        # Build normal OpenAI-style response
+        result = {
+            "id": f"proxy_{key_idx+1}_{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_name or "unknown",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": full_text},
+                    "finish_reason": finish_reason or "stop",
+                }
+            ],
+        }
+        if usage:
+            result["usage"] = usage
+
+        print(f"  [ok] Key {key_idx+1} (normal via stream)", flush=True)
+        return 200, json.dumps(result).encode()
 
     def _respond(self, code, body, ct):
         self.send_response(code)
@@ -239,11 +332,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._do_stream(path, body, key, idx)
                 return
             except _RateLimited:
-                record_failure(key)
+                # Don't increment failure counter — soft rate limit, wait and retry
+                print(f"  [rl] Key {idx+1}, backing off 8s", flush=True)
+                time.sleep(8)
                 continue
             except Exception as e:
-                print(f"  [err] {e}", flush=True)
-                record_failure(key)
+                print(f"  [err] Stream #{attempt}: {e}", flush=True)
+                record_failure(key, str(e)[:100])
                 continue
         save_rotation_state()
         self._respond(429, json.dumps({"error": "All keys rate limited"}).encode(), "application/json")
@@ -298,6 +393,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
 
         print(f"  [ok] Key {key_idx+1} (stream)", flush=True)
+        record_success(key)
 
 
 class _RateLimited(Exception):
