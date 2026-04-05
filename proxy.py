@@ -5,6 +5,7 @@ Uses ThreadingMixIn so multiple requests are handled concurrently.
 Streaming responses are forwarded chunk-by-chunk in real-time.
 """
 
+import argparse
 import json
 import time
 import os
@@ -14,6 +15,18 @@ import urllib.error
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+
+# ---- CLI ARGS ----
+parser = argparse.ArgumentParser(description="OpenRouter API Key Rotation Proxy")
+parser.add_argument(
+    "mode",
+    nargs="?",
+    default="mixed",
+    choices=["mixed", "stream"],
+    help="mixed (default): client decides mode; stream: force streaming for all requests",
+)
+args = parser.parse_args()
+force_stream_mode = (args.mode == "stream") or os.environ.get("PROXY_FORCE_STREAM") == "1"
 
 # ---- CONFIG ----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -184,8 +197,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
-        # Force non-streaming for Claude Code stability over proxy
-        is_stream = b'"stream":true' in body or b'"stream": true' in body
+        # Force streaming when PROXY_FORCE_STREAM is set or --stream mode
+        is_stream = force_stream_mode or b'"stream":true' in body or b'"stream": true' in body
 
         if is_stream:
             self._stream(path, body)
@@ -211,8 +224,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
             except _RateLimited:
                 # Don't increment failure counter — just wait briefly and retry
-                print(f"  [rl] Key {idx+1}, backing off 8s", flush=True)
-                time.sleep(8)
+                print(f"  [rl] Key {idx+1}, backing off 1s", flush=True)
+                time.sleep(1)
                 continue
             except Exception as e:
                 print(f"  [err] Normal #{attempt}: {e}", flush=True)
@@ -333,8 +346,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
             except _RateLimited:
                 # Don't increment failure counter — soft rate limit, wait and retry
-                print(f"  [rl] Key {idx+1}, backing off 8s", flush=True)
-                time.sleep(8)
+                print(f"  [rl] Key {idx+1}, backing off 1s", flush=True)
+                time.sleep(1)
                 continue
             except Exception as e:
                 print(f"  [err] Stream #{attempt}: {e}", flush=True)
@@ -411,6 +424,7 @@ if __name__ == "__main__":
     server = ThreadedHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
     print(f"[proxy] Starting on http://{PROXY_HOST}:{PROXY_PORT}", flush=True)
     print(f"[proxy] {len(keys_list)} keys from #{current_index+1}", flush=True)
+    print(f"[proxy] Mode: {'stream (forced)' if force_stream_mode else 'mixed (client decides)'}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

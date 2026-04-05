@@ -7,6 +7,7 @@ A lightweight, stdlib-only Python proxy for the OpenRouter API with automatic AP
 - **Key rotation**: Automatically rotates through multiple API keys when one hits rate limits
 - **Exponential backoff**: Locked keys are temporarily disabled (60s → 120s → 240s → max 1h)
 - **Streaming support**: Real-time SSE forwarding for streaming responses
+- **Forced stream mode**: `python3 proxy.py stream` forces all requests to use streaming (ideal for Claude Code)
 - **Concurrent**: Threaded request handling via `ThreadingMixIn`
 - **State persistence**: Rotation state survives restarts
 - **Health endpoint**: Monitor key availability at `GET /health`
@@ -35,8 +36,16 @@ Edit `keys.json` and add your OpenRouter API keys:
 
 ### 2. Start the proxy
 
+Default (mixed mode — client decides streaming or not):
+
 ```bash
 python3 proxy.py
+```
+
+Force streaming for all requests (recommended for Claude Code):
+
+```bash
+python3 proxy.py stream
 ```
 
 Or in the background:
@@ -78,6 +87,7 @@ Environment variables:
 | `PROXY_STATE_FILE` | `./key_rotation.json` | Path to rotation state file |
 | `PROXY_ANTHROPIC_MODE` | off (unset) | Set to `1` to add Anthropic-compatible headers |
 | `PROXY_SITE_URL` | `http://localhost` | HTTP-Referer header (OpenRouter recommended) |
+| `PROXY_FORCE_STREAM` | off (unset) | Set to `1` to force streaming for all requests (same as `stream` CLI arg) |
 | `PROXY_SITE_NAME` | `OpenRouter Key Rotation Proxy` | X-Title header (OpenRouter recommended) |
 
 ## How it works
