@@ -157,6 +157,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Suppress default verbose log
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass  # Client closed connection before/during request — ignore
+
     def finish(self):
         # Suppress I/O error when connection was closed (streaming with Connection: close)
         try:
