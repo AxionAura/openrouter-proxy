@@ -325,6 +325,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
         if usage:
             result["usage"] = usage
+        else:
+            # Some providers don't send usage in SSE — provide defaults
+            # so clients like Claude Code don't crash on missing fields
+            result["usage"] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            }
 
         print(f"  [ok] Key {key_idx+1} (normal via stream)", flush=True)
         return 200, json.dumps(result).encode()
@@ -391,7 +399,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
         self.send_header("X-Key-Index", str(key_idx + 1))
         self.end_headers()
 
@@ -411,6 +418,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+        self.close_connection = True
         print(f"  [ok] Key {key_idx+1} (stream)", flush=True)
         record_success(key)
 
