@@ -6,6 +6,7 @@ Streaming responses are forwarded chunk-by-chunk in real-time.
 """
 
 import argparse
+import hashlib
 import json
 import time
 import os
@@ -15,15 +16,88 @@ import urllib.error
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from datetime import datetime
+
+
+# ──────────────────────────────────────────────────────────
+# Console Colors & Logging
+# ──────────────────────────────────────────────────────────
+class C:
+    """ANSI color codes for professional console output."""
+    BOLD      = "\033[1m"
+    DIM       = "\033[2m"
+    CYAN      = "\033[96m"
+    BLUE      = "\033[94m"
+    GREEN     = "\033[92m"
+    YELLOW    = "\033[93m"
+    RED       = "\033[91m"
+    MAGENTA   = "\033[95m"
+    WHITE     = "\033[97m"
+    GRAY      = "\033[38;5;244m"
+    ORANGE    = "\033[38;5;208m"
+    BG_BLUE   = "\033[44m"
+    RESET     = "\033[0m"
+
+
+def _ts():
+    """Current timestamp as HH:MM:SS."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _prefix(tag, color, emoji):
+    return f"{C.DIM}{_ts()}{C.RESET} {color}{C.BOLD}{emoji} {tag}{C.RESET}"
+
+
+class Log:
+    @staticmethod
+    def info(msg):
+        print(f"{_prefix('INFO', C.CYAN, 'ℹ')}  {C.WHITE}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def key(msg, color=C.GREEN):
+        print(f"{_prefix('KEYS', C.MAGENTA, '🔑')}  {color}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def proxy(msg, color=C.BLUE):
+        print(f"{_prefix('PROXY', C.BLUE, '⚡')}  {color}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def success(msg):
+        print(f"{_prefix('OK  ', C.GREEN, '✓')}  {C.GREEN}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def error(msg):
+        print(f"{_prefix('ERR ', C.RED, '✗')}  {C.RED}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def warn(msg):
+        print(f"{_prefix('WARN', C.YELLOW, '⚠')}  {C.ORANGE}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def req(msg):
+        print(f"{_prefix('REQ ', C.CYAN, '»')}  {C.DIM}{msg}{C.RESET}", flush=True)
+
+    @staticmethod
+    def detail(msg):
+        print(f"         {C.DIM}{msg}{C.RESET}", flush=True)
+
+
+def print_banner():
+    """Print a professional startup banner."""
+    border = f"{C.DIM}{'─' * 58}{C.RESET}"
+    print(border, flush=True)
+    print(f"{C.BOLD}{C.CYAN}  ⚡  OpenRouter Key Rotation Proxy{C.RESET}", flush=True)
+    print(f"{C.DIM}  {C.CYAN}AxionAura{C.RESET}", flush=True)
+    print(border, flush=True)
 
 # ---- CLI ARGS ----
 parser = argparse.ArgumentParser(description="OpenRouter API Key Rotation Proxy")
 parser.add_argument(
     "mode",
     nargs="?",
-    default="mixed",
-    choices=["mixed", "stream"],
-    help="mixed (default): client decides mode; stream: force streaming for all requests",
+    default="stream",
+    choices=["stream", "mixed"],
+    help="stream (default): force streaming for all requests (avoids free-tier 402); mixed: client decides mode",
 )
 args = parser.parse_args()
 force_stream_mode = (args.mode == "stream") or os.environ.get("PROXY_FORCE_STREAM") == "1"
@@ -42,6 +116,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 keys_list = []
 key_failures = {}
 current_index = 0
+start_time = time.time()
 
 
 def load_keys():
@@ -50,9 +125,9 @@ def load_keys():
         with open(KEYS_FILE) as f:
             data = json.load(f)
         keys_list = data.get("keys", [])
-        print(f"[keys] Loaded {len(keys_list)} keys", flush=True)
+        Log.key(f"Loaded {len(keys_list)} key{'s' if len(keys_list) != 1 else ''}")
     except FileNotFoundError:
-        print(f"[error] {KEYS_FILE} not found", flush=True)
+        Log.error(f"{KEYS_FILE} not found")
         sys.exit(1)
 
 
@@ -63,9 +138,9 @@ def load_rotation_state():
             data = json.load(f)
         key_failures = data.get("key_failures", {})
         current_index = data.get("current_index", 0)
-        print(f"[state] Restored: current={current_index}", flush=True)
+        Log.info(f"State restored: key index {current_index}")
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        Log.info("No prior state found — starting fresh")
 
 
 def save_rotation_state():
@@ -83,7 +158,7 @@ def get_next_key():
         key = keys_list[idx]
         unlocked_at = key_failures.get(key, {}).get("unlocked_at", 0)
         if unlocked_at > 0 and now < unlocked_at:
-            print(f"  [skip] key {idx+1} locked, {int(unlocked_at - now)}s", flush=True)
+            Log.detail(f"Key {idx+1} locked, {int(unlocked_at - now)}s remaining")
             continue
         current_index = idx
         return key, 0
@@ -98,7 +173,7 @@ def get_next_key():
             soonest_idx = idx
     current_index = soonest_idx
     remaining = int(soonest - now)
-    print(f"[all locked] next in {remaining}s (key {soonest_idx+1})", flush=True)
+    Log.warn(f"All keys locked — next available in {remaining}s (key {soonest_idx+1})")
     return keys_list[soonest_idx], remaining
 
 
@@ -108,8 +183,8 @@ def record_failure(key, error_detail=None):
     wait = min(60 * (2 ** (state["failures"] - 1)), 3600)
     state["unlocked_at"] = time.time() + wait
     idx = keys_list.index(key)
-    detail = f" — {error_detail}" if error_detail else ""
-    print(f"  [fail] Key {idx+1} #{state['failures']}, unlock {int(wait)}s{detail}", flush=True)
+    detail = f" — {C.DIM}{error_detail}{C.RESET}" if error_detail else ""
+    Log.error(f"Key {idx+1} failure #{state['failures']}, locked for {int(wait)}s{detail}")
     save_rotation_state()
 
 
@@ -175,34 +250,154 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/health"):
-            now = time.time()
-            available = sum(
-                1 for k in keys_list
-                if key_failures.get(k, {}).get("unlocked_at", 0) == 0
-                   or now >= key_failures.get(k, {}).get("unlocked_at", 0)
-            )
-            body = json.dumps({
-                "status": "ok",
-                "current_key": current_index + 1,
-                "keys_total": len(keys_list),
-                "keys_available": available,
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            # Check if client wants HTML (browser)
+            accept = self.headers.get("Accept", "")
+            if "text/html" in accept or self.path == "/":
+                html = self._render_status_page()
+                body = html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                body = json.dumps({
+                    "status": "ok",
+                    "current_key": current_index + 1,
+                    "keys_total": len(keys_list),
+                    "keys_available": sum(
+                        1 for k in keys_list
+                        if key_failures.get(k, {}).get("unlocked_at", 0) == 0
+                           or time.time() >= key_failures.get(k, {}).get("unlocked_at", 0)
+                    ),
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             return
         self._route()
+
+    def _render_status_page(self):
+        """Beautiful HTML dashboard for browser status view."""
+        now = time.time()
+        total = len(keys_list)
+        available = sum(
+            1 for k in keys_list
+            if key_failures.get(k, {}).get("unlocked_at", 0) == 0
+               or now >= key_failures.get(k, {}).get("unlocked_at", 0)
+        )
+        uptime = time.time() - start_time
+
+        status_pill = f'<span class="pill ok">● {available}/{total} Available</span>'
+
+        rows = ""
+        for i, key in enumerate(keys_list):
+            state = key_failures.get(key, {})
+            fail_count = state.get("failures", 0)
+            unlocked_at = state.get("unlocked_at", 0)
+
+            if fail_count == 0 and unlocked_at == 0:
+                status = '<span class="status ok">Active</span>'
+                remaining = "—"
+            elif now >= unlocked_at:
+                status = '<span class="status ok">Recovered</span>'
+                remaining = "—"
+                fail_count = 0  # reset display
+            else:
+                secs = int(unlocked_at - now)
+                status = f'<span class="status locked">Locked · {secs}s</span>'
+                remaining = f"⏱ {secs}s"
+
+            is_current = ' class="current"' if i == current_index else ""
+            key_short = f"...{key[-6:]}" if len(key) > 10 else key.replace(" ", "")
+            rows += f"""<tr{is_current}>
+                <td class="key-num">{'▶' if i == current_index else ' '}{i+1}</td>
+                <td class="key-val">{key_short}</td>
+                <td>{status}</td>
+                <td class="fail">{fail_count}</td>
+                <td class="rem">{remaining}</td>
+            </tr>\n"""
+
+        mode_text = 'stream' if force_stream_mode else 'mixed'
+        mode_label = f'<span class="mode">{mode_text} mode</span>'
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenRouter Proxy — AxionAura</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    background: #0d1117; color: #c9d1d9;
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    padding: 2rem; min-height: 100vh;
+  }}
+  .container {{ max-width: 720px; margin: 0 auto; }}
+  h1 {{ color: #58a6ff; font-size: 1.5rem; margin-bottom: .25rem; }}
+  .subtitle {{ color: #484f58; font-size: .85rem; margin-bottom: 1.5rem; }}
+  .meta {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }}
+  .pill {{ padding: .3rem .7rem; border-radius: 999px; font-size: .8rem; font-weight: 600; }}
+  .pill.ok {{ background: #23863633; color: #3fb950; }}
+  .pill.host {{ background: #1f6feb33; color: #58a6ff; }}
+  .pill.mode {{ background: #d2992233; color: #d29922; }}
+  .uptime {{ color: #484f58; font-size: .8rem; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th {{ text-align: left; padding: .5rem .75rem; color: #484f58; font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #21262d; }}
+  td {{ padding: .6rem .75rem; border-bottom: 1px solid #161b22; font-size: .85rem; }}
+  tr.current {{ background: #1f6feb11; }}
+  tr:hover {{ background: #ffffff08; }}
+  tr.current:hover {{ background: #1f6feb22; }}
+  .key-num {{ font-weight: 700; color: #58a6ff; width: 3rem; }}
+  .key-val {{ font-family: 'SF Mono', 'Fira Code', monospace; font-size: .8rem; color: #8b949e; }}
+  .status {{ padding: .15rem .5rem; border-radius: 999px; font-size: .75rem; font-weight: 500; }}
+  .status.ok {{ background: #23863633; color: #3fb950; }}
+  .status.locked {{ background: #da363333; color: #f85149; }}
+  .fail {{ color: #f85149; text-align: center; }}
+  .rem {{ color: #d29922; }}
+  .footer {{ margin-top: 2rem; text-align: center; color: #30363d; font-size: .75rem; }}
+  .footer a {{ color: #58a6ff; text-decoration: none; }}
+  td.current-indicator {{ width: 4px; border-left: 3px solid #58a6ff; }}
+  @keyframes pulse {{ 0%,100% {{ opacity: 1 }} 50% {{ opacity: .5 }} }}
+  .pill.ok {{ animation: pulse 3s ease-in-out infinite; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>⚡ OpenRouter Key Rotation Proxy</h1>
+  <p class="subtitle">AxionAura</p>
+  <div class="meta">
+    {status_pill}
+    <span class="pill host">🌐 http://{PROXY_HOST}:{PROXY_PORT}</span>
+    <span class="pill mode">🔄 {mode_text} mode</span>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>Key</th><th>Status</th><th>Fails</th><th>Unlocks</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <p class="footer">Built by <a href="https://github.com/AxionAura">AxionAura</a></p>
+</div>
+</body>
+</html>"""
 
     def _route(self):
         if "chat/completions" in self.path:
             path = "/chat/completions"
-        else:
+        elif "messages" in self.path:
             path = "/messages"
+        else:
+            # Unknown path — not an API request
+            body = json.dumps({"error": "Not found", "path": self.path}).encode()
+            self._respond(404, body, "application/json")
+            return
 
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
+        if not body:
+            self._respond(400, json.dumps({"error": "Empty request body"}).encode(), "application/json")
+            return
         # Force streaming when PROXY_FORCE_STREAM is set or --stream mode
         is_stream = force_stream_mode or b'"stream":true' in body or b'"stream": true' in body
 
@@ -211,6 +406,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             self._normal(path, body)
 
+    @staticmethod
+    def _inject_usage(body_bytes):
+        """Ensure response always has usage.input_tokens so clients don't crash."""
+        try:
+            data = json.loads(body_bytes)
+            if "usage" not in data:
+                data["usage"] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            return json.dumps(data).encode()
+        except json.JSONDecodeError:
+            return body_bytes
+
     # ---- non-streaming ----
 
     def _normal(self, path, body):
@@ -218,23 +424,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for attempt in range(1, max_a + 1):
             key, wait = get_next_key()
             if wait > 0:
-                print(f"[wait] {wait}s", flush=True)
+                Log.warn(f"Waiting {wait}s for key unlock...")
                 time.sleep(wait)
             idx = keys_list.index(key)
-            print(f"[try] Key {idx+1} (normal) #{attempt}", flush=True)
+            Log.req(f"Key {idx+1} (normal) attempt #{attempt}")
             try:
                 status, resp_body = self._do_non_stream(path, body, key, idx)
+                resp_body = ProxyHandler._inject_usage(resp_body)
                 self._respond(status, resp_body, "application/json")
                 if status == 200:
                     record_success(key)
                 return
             except _RateLimited:
-                # Don't increment failure counter — just wait briefly and retry
-                print(f"  [rl] Key {idx+1}, backing off 1s", flush=True)
+                Log.warn(f"Key {idx+1} rate limited, backing off 1s")
                 time.sleep(1)
                 continue
+            except ConnectionResetError:
+                Log.info(f"Client disconnected during normal request #{attempt}")
+                return
             except Exception as e:
-                print(f"  [err] Normal #{attempt}: {e}", flush=True)
+                Log.error(f"Normal request #{attempt}: {e}")
                 record_failure(key, str(e)[:100])
                 continue
         save_rotation_state()
@@ -244,7 +453,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """Send request with stream:true internally, parse SSE, return full JSON response.
         This avoids HTTP 402 on free-tier OpenRouter accounts."""
         # Inject stream flag into body
-        data = json.loads(body)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON body: {e}")
         data["stream"] = True
         stream_body = json.dumps(data).encode()
 
@@ -310,8 +522,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     pass
 
         # Build normal OpenAI-style response
+        resp_id = hashlib.md5(f"{key}_{int(time.time()*1000)}".encode()).hexdigest()[:16]
         result = {
-            "id": f"proxy_{key_idx+1}_{int(time.time())}",
+            "id": f"chatcmpl-{resp_id}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model_name or "unknown",
@@ -334,7 +547,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "total_tokens": 0,
             }
 
-        print(f"  [ok] Key {key_idx+1} (normal via stream)", flush=True)
+        Log.success(f"Key {key_idx+1} responded (normal via stream)")
         return 200, json.dumps(result).encode()
 
     def _respond(self, code, body, ct):
@@ -351,20 +564,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for attempt in range(1, max_a + 1):
             key, wait = get_next_key()
             if wait > 0:
-                print(f"[wait] {wait}s", flush=True)
+                Log.warn(f"Waiting {wait}s for key unlock...")
                 time.sleep(wait)
             idx = keys_list.index(key)
-            print(f"[try] Key {idx+1} (stream) #{attempt}", flush=True)
+            Log.req(f"Key {idx+1} (stream) attempt #{attempt}")
             try:
                 self._do_stream(path, body, key, idx)
                 return
             except _RateLimited:
-                # Don't increment failure counter — soft rate limit, wait and retry
-                print(f"  [rl] Key {idx+1}, backing off 1s", flush=True)
+                Log.warn(f"Key {idx+1} rate limited, backing off 1s")
                 time.sleep(1)
                 continue
             except Exception as e:
-                print(f"  [err] Stream #{attempt}: {e}", flush=True)
+                Log.error(f"Stream #{attempt}: {e}")
                 record_failure(key, str(e)[:100])
                 continue
         save_rotation_state()
@@ -399,6 +611,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("X-Key-Index", str(key_idx + 1))
         self.end_headers()
 
@@ -414,12 +628,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            print(f"  [client disconnect]", flush=True)
+            Log.info("Client disconnected mid-stream")
         finally:
             conn.close()
 
         self.close_connection = True
-        print(f"  [ok] Key {key_idx+1} (stream)", flush=True)
+        Log.success(f"Key {key_idx+1} responded (stream)")
         record_success(key)
 
 
@@ -435,11 +649,20 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 if __name__ == "__main__":
     load_keys()
     load_rotation_state()
-    server = ThreadedHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
-    print(f"[proxy] Starting on http://{PROXY_HOST}:{PROXY_PORT}", flush=True)
-    print(f"[proxy] {len(keys_list)} keys from #{current_index+1}", flush=True)
-    print(f"[proxy] Mode: {'stream (forced)' if force_stream_mode else 'mixed (client decides)'}", flush=True)
+    server = None
     try:
+        server = ThreadedHTTPServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
+        print_banner()
+        mode_label = "stream (forced)" if force_stream_mode else "mixed (client decides)"
+        Log.proxy(f"Listening on {C.BOLD}{C.CYAN}http://{PROXY_HOST}:{PROXY_PORT}{C.RESET}")
+        Log.proxy(f"{len(keys_list)} keys loaded, starting from key {C.BOLD}{current_index+1}{C.RESET}")
+        Log.proxy(f"Mode: {C.YELLOW}{mode_label}{C.RESET}")
+        Log.proxy(f"Env: config from {C.DIM}.env{C.RESET} or {C.DIM}systemd{C.RESET}")
+        print(f"{C.DIM}{'─' * 58}{C.RESET}", flush=True)
+        Log.info("Ready to accept connections\n")
         server.serve_forever()
     except KeyboardInterrupt:
-        server.shutdown()
+        if server:
+            print(f"\n{C.DIM}{'─' * 58}{C.RESET}", flush=True)
+            Log.info(f"{C.BOLD}Shutting down gracefully...{C.RESET}")
+            server.shutdown()
