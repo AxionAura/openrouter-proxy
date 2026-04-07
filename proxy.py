@@ -246,38 +246,57 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pass  # Already closed — nothing to do
 
     def do_POST(self):
+        if self.path == "/reload":
+            self._reload_state()
+            return
         self._route()
 
     def do_GET(self):
         if self.path in ("/", "/health"):
-            # Check if client wants HTML (browser)
-            accept = self.headers.get("Accept", "")
-            if "text/html" in accept or self.path == "/":
-                html = self._render_status_page()
-                body = html.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                body = json.dumps({
-                    "status": "ok",
-                    "current_key": current_index + 1,
-                    "keys_total": len(keys_list),
-                    "keys_available": sum(
-                        1 for k in keys_list
-                        if key_failures.get(k, {}).get("unlocked_at", 0) == 0
-                           or time.time() >= key_failures.get(k, {}).get("unlocked_at", 0)
-                    ),
-                }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+            self._serve_status()
+            return
+        if self.path == "/reload":
+            self._reload_state()
             return
         self._route()
+
+    def _reload_state(self):
+        """Reload keys and reset failure counters without restart."""
+        global key_failures, current_index
+        key_failures = {}
+        current_index = 0
+        load_keys()
+        save_rotation_state()
+        Log.info("All keys reloaded, failure counters reset")
+        body = json.dumps({"status": "reloaded"}).encode()
+        self._respond(200, body, "application/json")
+
+    def _serve_status(self):
+        """Render the status page based on client Accept header."""
+        accept = self.headers.get("Accept", "")
+        if "text/html" in accept:
+            body = self._render_status_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = json.dumps({
+                "status": "ok",
+                "current_key": current_index + 1,
+                "keys_total": len(keys_list),
+                "keys_available": sum(
+                    1 for k in keys_list
+                    if key_failures.get(k, {}).get("unlocked_at", 0) == 0
+                       or time.time() >= key_failures.get(k, {}).get("unlocked_at", 0)
+                ),
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def _render_status_page(self):
         """Beautiful HTML dashboard for browser status view."""
