@@ -420,6 +420,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ---- non-streaming ----
 
     def _normal(self, path, body):
+        global current_index
         max_a = len(keys_list) + 1
         for attempt in range(1, max_a + 1):
             key, wait = get_next_key()
@@ -436,8 +437,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     record_success(key)
                 return
             except _RateLimited:
-                Log.warn(f"Key {idx+1} rate limited, backing off 1s")
-                time.sleep(1)
+                Log.warn(f"Key {idx+1} rate limited, skipping to next")
+                current_index = (current_index + 1) % len(keys_list)
                 continue
             except ConnectionResetError:
                 Log.info(f"Client disconnected during normal request #{attempt}")
@@ -490,7 +491,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         conn.close()
 
         if resp.status != 200:
-            return resp.status, buf
+            # Inject usage into error response so client doesn't crash
+            error_resp = ProxyHandler._inject_usage(buf)
+            return resp.status, error_resp
 
         # Parse SSE to accumulate content
         full_text = ""
@@ -560,6 +563,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ---- streaming ----
 
     def _stream(self, path, body):
+        global current_index
         max_a = len(keys_list) + 1
         for attempt in range(1, max_a + 1):
             key, wait = get_next_key()
@@ -572,8 +576,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._do_stream(path, body, key, idx)
                 return
             except _RateLimited:
-                Log.warn(f"Key {idx+1} rate limited, backing off 1s")
-                time.sleep(1)
+                Log.warn(f"Key {idx+1} rate limited, skipping to next")
+                current_index = (current_index + 1) % len(keys_list)
                 continue
             except Exception as e:
                 Log.error(f"Stream #{attempt}: {e}")
